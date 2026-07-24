@@ -14,5 +14,10 @@ config/tencent.json
 .workbuddy/
 .trae/
 
+# PyInstaller 打包产物
+dist/
+build/
+*.spec~
+
 # 示例/样本数据（不上传）
 sample/

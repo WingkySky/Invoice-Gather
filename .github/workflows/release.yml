@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller pywebview pymupdf openpyxl
+        pip install -r requirements.txt
+
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller pywebview pymupdf openpyxl
+        pip install -r requirements.txt
+
+    - name: Install dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtwebengine
+        python -m pip install --upgrade pip
+        pip install pyinstaller pywebview pymupdf openpyxl
+        pip install -r requirements.txt
+
+    - name: Build (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        pyinstaller build.spec --distpath dist
+        Rename-Item -Path "dist\票归集" -NewName "票归集-Windows"
+        Compress-Archive -Path "dist\票归集-Windows" -DestinationPath "dist\票归集-Windows.zip"
+
+    - name: Build (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        pyinstaller build.spec --distpath dist
+        mv dist/票归集.app dist/票归集-macOS.app
+        zip -r dist/票归集-macOS.zip dist/票归集-macOS.app
+
+    - name: Build (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        pyinstaller build.spec --distpath dist
+        mv dist/票归集 dist/票归集-Linux
+        tar -czvf dist/票归集-Linux.tar.gz -C dist 票归集-Linux
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          dist/票归集-Windows.zip
+          dist/票归集-macOS.zip
+          dist/票归集-Linux.tar.gz
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

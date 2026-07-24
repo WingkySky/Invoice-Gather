@@ -4,6 +4,9 @@
 # HTTP 请求（IMAP 之外的邮件正文链接抓取、51发票接口调用）
 requests==2.34.2
 
+# 桌面应用（pywebview，打包桌面窗口）
+pywebview==4.0.0
+
 # HTML 解析（engine 用 BeautifulSoup(html, "lxml")，需 lxml 作为解析器后端）
 beautifulsoup4==4.15.0
 lxml==6.1.1
