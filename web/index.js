@@ -496,6 +496,7 @@ function matchRenderResult(r){
   document.getElementById('matchStats').innerHTML = `
     <div class="card"><div class="k">已匹配</div><div class="v" style="color:var(--ok)">${stats.matched||0}</div></div>
     <div class="card"><div class="k">凑票组</div><div class="v" style="color:var(--warn)">${stats.many_to_one_groups||0}</div></div>
+    <div class="card"><div class="k">拆票行</div><div class="v" style="color:#3a7bd5">${stats.one_to_many||0}</div></div>
     <div class="card"><div class="k">未匹配</div><div class="v" style="color:var(--bad)">${stats.unmatched||0}</div></div>
     <div class="card"><div class="k">跳过</div><div class="v" style="color:var(--muted)">${stats.skipped||0}</div></div>`;
 
@@ -571,6 +572,8 @@ function matchRenderResult(r){
         bg = 'background:#e6f6ec'; status = '已匹配'; matchType = '一对一';
       } else if(mt === 'many_to_one'){
         bg = 'background:#fdf6e3'; status = '已匹配(凑票)'; matchType = '多对一';
+      } else if(mt === 'one_to_many'){
+        bg = 'background:#eaf2fb'; status = '已匹配(拆票)'; matchType = '一对多';
       } else {
         bg = 'background:#e6f6ec'; status = '已匹配'; matchType = mt || '';
       }

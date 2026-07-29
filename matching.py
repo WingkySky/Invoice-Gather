@@ -13,6 +13,7 @@ from datetime import datetime, date, timedelta
 from itertools import combinations
 
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 
 import db
 
@@ -22,11 +23,14 @@ class MatchConfig:
     """匹配配置。支持属性访问；也可直接传 dict 给各匹配函数（用 _cfg_get 兼容）。"""
 
     def __init__(self, date_range_days=30, overwrite=False,
-                 max_combo_size=5, group_time_budget=2.0):
+                 max_combo_size=10, group_time_budget=2.0,
+                 max_one_to_many_size=10):
         self.date_range_days = date_range_days
         self.overwrite = overwrite
         self.max_combo_size = max_combo_size
         self.group_time_budget = group_time_budget
+        # 一对多拆票：一张模板行最多由几张发票合并。None 表示用代码默认 10。
+        self.max_one_to_many_size = max_one_to_many_size
 
 
 def _cfg_get(config, name, default):
@@ -194,8 +198,76 @@ def _score_candidate(remark, row_date, merchant):
     return score
 
 
-# ----------------------------------------------------------- 2. 一对一匹配
-def match_one_to_one(template_rows, candidates, config):
+# ----------------------------------------------------------- 0. 多对一预扫描
+def find_reserved_rows(template_rows, candidates, config):
+    """预扫描多对一组合，标记应"保留给多对一"的行，避免被第一轮一对一抢占。
+
+    背景：一对一优先策略下，若某行金额恰好等于一张发票，第一轮会把它一对一匹配掉，
+    可能破坏更优的多对一组合（同日同买方多行合并到一张大发票）。
+
+    判定条件（同时满足）：
+      1. 该行参与某个"同日同买方"的多对一组合（组合内各行发放日期相同）
+      2. 组合金额合计等于某张可用发票金额
+      3. 该行自身金额恰好等于某张可用发票金额（即会被一对一抢走）
+
+    满足以上条件的行加入 reserved_row_idxs，第一轮一对一将跳过它们。
+
+    返回 set(row_idx)。
+    """
+    max_combo_size = _cfg_get(config, "max_combo_size", 10)
+    overwrite = _cfg_get(config, "overwrite", False)
+
+    # 待匹配行按 buyer 分组（跳过已有发票号且不覆盖的行）
+    groups = {}
+    for row in template_rows:
+        if row.get("existing_invoice_no") and not overwrite:
+            continue
+        if row.get("amount") is None or row.get("date") is None:
+            continue
+        groups.setdefault(row.get("buyer"), []).append(row)
+
+    if not groups:
+        return set()
+
+    # 收集每个 buyer 下的可用发票金额集合
+    buyer_inv_amounts = {}
+    for inv in candidates:
+        for buyer in groups:
+            if _buyer_match(inv.get("buyer"), buyer):
+                buyer_inv_amounts.setdefault(buyer, set()).add(round(inv.get("amount", 0) or 0, 2))
+
+    reserved = set()
+    for buyer, rows in groups.items():
+        inv_amounts = buyer_inv_amounts.get(buyer)
+        if not inv_amounts:
+            continue
+
+        # 同日分组（同一天发放的行倾向于合并到一张发票）
+        by_date = {}
+        for r in rows:
+            d = _to_datetime(r.get("date"))
+            if d is None:
+                continue
+            by_date.setdefault(d.date(), []).append(r)
+
+        for d, drows in by_date.items():
+            if len(drows) < 2:
+                continue
+            upper = min(max_combo_size, len(drows))
+            for size in range(2, upper + 1):
+                for combo in combinations(drows, size):
+                    combo_sum = round(sum(r["amount"] for r in combo), 2)
+                    if combo_sum not in inv_amounts:
+                        continue
+                    # 组合成立：标记组合内"金额恰好等于某张发票"的行
+                    for r in combo:
+                        if round(r["amount"], 2) in inv_amounts:
+                            reserved.add(r["row_idx"])
+    return reserved
+
+
+# ----------------------------------------------------------- 1. 一对一匹配
+def match_one_to_one(template_rows, candidates, config, reserved_row_idxs=None):
     """第一轮：一对一金额匹配。
 
     对每个待匹配行（existing_invoice_no 为空 或 overwrite=True）：
@@ -205,15 +277,23 @@ def match_one_to_one(template_rows, candidates, config):
       - 已匹配发票加入 used_invoice_ids，不再复用
 
     返回 [{"row_idx","amount","invoice_no","invoice_id","match_type":"one_to_one","score"}, ...]
+
+    reserved_row_idxs: 预扫描标记的"保留给多对一"的行 idx 集合，这些行在第一轮跳过，
+        留给第二轮多对一消化（避免一对一抢占关键行破坏同日合并组合）。
     """
     date_range_days = _cfg_get(config, "date_range_days", 30)
     overwrite = _cfg_get(config, "overwrite", False)
+    if reserved_row_idxs is None:
+        reserved_row_idxs = set()
 
     used_invoice_ids = set()
     matched = []
     for row in template_rows:
         # 已有发票号且不覆盖 → 跳过
         if row.get("existing_invoice_no") and not overwrite:
+            continue
+        # 预扫描保留行 → 跳过，留给多对一
+        if row["row_idx"] in reserved_row_idxs:
             continue
         row_date = _to_datetime(row.get("date"))
         buyer = row.get("buyer")
@@ -247,8 +327,9 @@ def match_one_to_one(template_rows, candidates, config):
             for inv in avail
         ]
         max_score = max(s for s, _ in scored)
-        # 取最高分；并列时取首个（按候选顺序稳定）
-        chosen = next(inv for s, inv in scored if s == max_score)
+        # 同分 tie-break：取发票日期最早的（候选已按 invoice_date ASC，但多 buyer 合并后不保证，显式排序更稳）
+        best = [inv for s, inv in scored if s == max_score]
+        chosen = min(best, key=lambda inv: _to_datetime(inv.get("invoice_date")) or datetime.max)
         used_invoice_ids.add(chosen["id"])
 
         matched.append({
@@ -352,6 +433,92 @@ def match_many_to_one(unmatched_rows, remaining_candidates, config):
     return matched
 
 
+# ----------------------------------------------------------- 3.5 一对多拆票
+def match_one_to_many(unmatched_rows, remaining_candidates, config, used_invoice_ids=None):
+    """第三轮：一对多拆票。一行模板金额 = 多张未用发票金额合计。
+
+    场景：一笔支出由多张发票合并开具（如 1,262,831.61 = 1,259,925.57 + 2,906.04）。
+    回填格式：多张发票号用换行符分隔（单元格内换行，配合 wrap_text 显示）。
+
+    - 按 buyer + 日期范围筛选候选
+    - 子集和：找 2~max_one_to_many_size 张发票组合，round 后等于行金额
+    - 单张金额超过行金额的发票直接排除（剪枝）
+    - 时间预算 group_time_budget（默认 2 秒）防组合爆炸
+    - 按行金额降序处理（大金额行更难凑，优先消化）
+
+    返回 [{"row_idx","amount","invoice_no","invoice_ids":[...],"match_type":"one_to_many"}, ...]
+    used_invoice_ids 会被本函数原地追加消耗的发票 id。
+    """
+    max_one_to_many_size = _cfg_get(config, "max_one_to_many_size", 10)
+    date_range_days = _cfg_get(config, "date_range_days", 30)
+    group_time_budget = _cfg_get(config, "group_time_budget", 2.0)
+    if used_invoice_ids is None:
+        used_invoice_ids = set()
+
+    # 按金额降序处理（大金额行组合搜索成本高，优先消化）
+    rows_todo = [r for r in unmatched_rows
+                 if r.get("amount") is not None and r.get("date") is not None]
+    rows_todo.sort(key=lambda r: r["amount"], reverse=True)
+
+    matched = []
+    for row in rows_todo:
+        row_date = _to_datetime(row.get("date"))
+        buyer = row.get("buyer")
+        target = round(row["amount"], 2)
+
+        date_start = row_date
+        date_end = row_date + timedelta(days=date_range_days)
+
+        avail = []
+        for inv in remaining_candidates:
+            if inv["id"] in used_invoice_ids:
+                continue
+            if not _buyer_match(inv.get("buyer"), buyer):
+                continue
+            inv_date = _to_datetime(inv.get("invoice_date"))
+            if inv_date is None or inv_date < date_start or inv_date > date_end:
+                continue
+            if round(inv.get("amount", 0) or 0, 2) > target:
+                continue  # 单张超目标，剪枝
+            avail.append(inv)
+
+        if len(avail) < 2:
+            continue
+
+        # 按金额升序排序，便于子集和搜索早停
+        avail.sort(key=lambda inv: round(inv.get("amount", 0) or 0, 2))
+        upper = min(max_one_to_many_size, len(avail))
+
+        start_t = time.time()
+        found = None
+        for size in range(2, upper + 1):
+            if time.time() - start_t > group_time_budget:
+                break
+            for combo in combinations(avail, size):
+                if time.time() - start_t > group_time_budget:
+                    break
+                if round(sum(c["amount"] for c in combo), 2) == target:
+                    found = combo
+                    break
+            if found:
+                break
+
+        if not found:
+            continue
+
+        for inv in found:
+            used_invoice_ids.add(inv["id"])
+        invoice_nos = "\n".join(inv["invoice_no"] for inv in found)
+        matched.append({
+            "row_idx": row["row_idx"],
+            "amount": target,
+            "invoice_no": invoice_nos,
+            "invoice_ids": [inv["id"] for inv in found],
+            "match_type": "one_to_many",
+        })
+    return matched
+
+
 # ----------------------------------------------------------- 4. 结果组装
 def build_result(template_rows, matched, unmatched, template_info, overwrite=False):
     """组装最终匹配结果。
@@ -379,6 +546,7 @@ def build_result(template_rows, matched, unmatched, template_info, overwrite=Fal
         m["group_id"] for m in matched
         if m.get("match_type") == "many_to_one" and m.get("group_id") is not None
     }
+    one_to_many_count = sum(1 for m in matched if m.get("match_type") == "one_to_many")
 
     return {
         "matched": matched,
@@ -388,6 +556,7 @@ def build_result(template_rows, matched, unmatched, template_info, overwrite=Fal
         "stats": {
             "matched": len(matched),
             "many_to_one_groups": len(many_to_one_groups),
+            "one_to_many": one_to_many_count,
             "unmatched": len(unmatched),
             "skipped": len(skipped),
         },
@@ -414,7 +583,11 @@ def generate_filled_xlsx(template_bytes, columns_map, confirmed_matched):
 
     col_1based = inv_col + 1  # 0-based → openpyxl 1-based
     for item in confirmed_matched:
-        ws.cell(row=int(item["row_idx"]), column=col_1based).value = item["invoice_no"]
+        cell = ws.cell(row=int(item["row_idx"]), column=col_1based)
+        cell.value = item["invoice_no"]
+        # 一对多拆票回填的多张发票号含换行符，开启自动换行以正确显示
+        if isinstance(item["invoice_no"], str) and "\n" in item["invoice_no"]:
+            cell.alignment = Alignment(wrapText=True)
     buf = io.BytesIO()
     wb.save(buf)
     wb.close()
@@ -436,8 +609,9 @@ def run_match(template_bytes, columns_map, config, date_range_days, overwrite):
     """
     cfg = MatchConfig(date_range_days=date_range_days, overwrite=overwrite)
     if config is not None:
-        cfg.max_combo_size = _cfg_get(config, "max_combo_size", 5)
+        cfg.max_combo_size = _cfg_get(config, "max_combo_size", 10)
         cfg.group_time_budget = _cfg_get(config, "group_time_budget", 2.0)
+        cfg.max_one_to_many_size = _cfg_get(config, "max_one_to_many_size", 10)
 
     template_info = parse_template(template_bytes)
 
@@ -463,8 +637,11 @@ def run_match(template_bytes, columns_map, config, date_range_days, overwrite):
         d_to = (max(bdates) + timedelta(days=date_range_days)).strftime("%Y-%m-%d")
         all_candidates.extend(db.get_invoices_for_matching(buyer, d_from, d_to))
 
-    # 第一轮：一对一
-    matched = match_one_to_one(template_rows, all_candidates, cfg)
+    # 第 0 步：预扫描多对一组合，标记应保留给多对一的行（避免被一对一抢占）
+    reserved_row_idxs = find_reserved_rows(template_rows, all_candidates, cfg)
+
+    # 第一轮：一对一（跳过保留行）
+    matched = match_one_to_one(template_rows, all_candidates, cfg, reserved_row_idxs)
     matched_row_idxs = {m["row_idx"] for m in matched}
     used_invoice_ids = {m["invoice_id"] for m in matched}
 
@@ -485,12 +662,21 @@ def run_match(template_bytes, columns_map, config, date_range_days, overwrite):
         amt = round(row["amount"], 2) if row.get("amount") is not None else None
         unmatched.append({"row_idx": row["row_idx"], "amount": amt, "reason": reason})
 
-    # 第二轮：多对一
+    # 第二轮：多对一（多行金额合计 = 一张发票）
     remaining_candidates = [c for c in all_candidates if c["id"] not in used_invoice_ids]
     m2o = match_many_to_one(unmatched_rows, remaining_candidates, cfg)
     matched.extend(m2o)
     m2o_row_idxs = {m["row_idx"] for m in m2o}
+    used_invoice_ids.update(m["invoice_id"] for m in m2o)
     # 从 unmatched 中移除已被多对一匹配的行
     unmatched = [u for u in unmatched if u["row_idx"] not in m2o_row_idxs]
+    unmatched_rows = [r for r in unmatched_rows if r["row_idx"] not in m2o_row_idxs]
+
+    # 第三轮：一对多拆票（一行金额 = 多张发票合计）
+    remaining_candidates = [c for c in all_candidates if c["id"] not in used_invoice_ids]
+    o2m = match_one_to_many(unmatched_rows, remaining_candidates, cfg, used_invoice_ids)
+    matched.extend(o2m)
+    o2m_row_idxs = {m["row_idx"] for m in o2m}
+    unmatched = [u for u in unmatched if u["row_idx"] not in o2m_row_idxs]
 
     return build_result(template_rows, matched, unmatched, template_info, overwrite=overwrite)

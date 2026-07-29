@@ -45,5 +45,12 @@
   "_comment_pdf_invoice_keywords": "附件/PDF 发票识别的「强证据」关键词：PDF 正文含其一才视为发票。普通 PDF（合同/报告/账单）即使恰好含一串 20 位数字，也不应被当作发票入库——这是把'只是因为它是 PDF'挡在门外的关键闸门。",
   "pdf_invoice_keywords": ["发票", "增值税", "普通发票", "专用发票", "电子发票", "全电发票", "价税合计", "销售方", "购买方", "开票日期", "纳税人识别号", "发票代码", "发票号码", "税额"],
   "_comment_detect_attachment_invoices": "附件发票探测：邮件标题没写发票关键词、但带了 PDF 附件时，也下载解析该附件（默认开）。误判严重时设为 false 可回退到只看标题的旧行为。",
-  "detect_attachment_invoices": true
+  "detect_attachment_invoices": true,
+
+  "_comment_matching": "模板匹配引擎参数。max_combo_size=多对一凑票时单组最多行数；max_one_to_many_size=一对多拆票时单行最多发票张数；group_time_budget=单组组合搜索时间预算(秒)。",
+  "matching": {
+    "max_combo_size": 10,
+    "max_one_to_many_size": 10,
+    "group_time_budget": 2.0
+  }
 }

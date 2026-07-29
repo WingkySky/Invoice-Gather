@@ -84,6 +84,22 @@ def _parse_filters(qs):
             pass
     if qs.get("attribution_status"):
         f["attribution_status"] = qs["attribution_status"][0]
+    # 金额筛选:精确金额或范围(amount_min, amount_max)
+    if qs.get("amount"):
+        try:
+            f["amount"] = float(qs["amount"][0])
+        except ValueError:
+            pass
+    if qs.get("amount_min"):
+        try:
+            f["amount_min"] = float(qs["amount_min"][0])
+        except ValueError:
+            pass
+    if qs.get("amount_max"):
+        try:
+            f["amount_max"] = float(qs["amount_max"][0])
+        except ValueError:
+            pass
     return f
 
 
@@ -270,7 +286,11 @@ class Handler(BaseHTTPRequestHandler):
             disposition = "attachment; filename=\"" + asc + "\"; filename*=UTF-8''" + quoted
             self.send_header("Content-Disposition", disposition)
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # 客户端断开连接（刷新/关闭页面等）,无需处理
+            pass
 
     # ----------------------------------------------------- GET
     def do_GET(self):
@@ -659,12 +679,21 @@ class Handler(BaseHTTPRequestHandler):
             fid = payload.get("file_id")
             date_range_days = int(payload.get("date_range_days", 30))
             overwrite = bool(payload.get("overwrite", False))
+            # 匹配参数：rules.json 的 matching 节作为默认值，前端传参覆盖
+            try:
+                rules_matching = engine.load_rules().get("matching", {})
+            except Exception:
+                rules_matching = {}
+            match_cfg = dict(rules_matching)
+            for k in ("max_combo_size", "max_one_to_many_size", "group_time_budget"):
+                if k in payload and payload[k] is not None:
+                    match_cfg[k] = payload[k]
             with _MATCH_LOCK:
                 f = MATCH_FILES.get(fid)
             if not f:
                 _json(self, {"ok": False, "msg": "文件不存在，请重新上传"})
                 return
-            def _match_job(report, fid, date_range_days, overwrite):
+            def _match_job(report, fid, date_range_days, overwrite, match_cfg):
                 with _MATCH_LOCK:
                     f = MATCH_FILES.get(fid)
                 if not f:
@@ -672,14 +701,14 @@ class Handler(BaseHTTPRequestHandler):
                 template_bytes = f["template_bytes"]
                 columns_map = f["columns_map"]
                 try:
-                    result = matching.run_match(template_bytes, columns_map, None, date_range_days, overwrite)
+                    result = matching.run_match(template_bytes, columns_map, match_cfg, date_range_days, overwrite)
                     with _MATCH_LOCK:
                         MATCH_FILES[fid]["result"] = result
                     report(msg="匹配完成")
                 except Exception as e:
                     report(msg=f"匹配失败：{type(e).__name__}: {e}")
                     raise
-            jid = start_job("match", _match_job, fid, date_range_days, overwrite)
+            jid = start_job("match", _match_job, fid, date_range_days, overwrite, match_cfg)
             _json(self, {"ok": True, "job_id": jid, "file_id": fid})
             return
 
