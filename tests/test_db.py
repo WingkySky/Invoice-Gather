@@ -118,7 +118,7 @@ class AccountPrefsTest(unittest.TestCase):
             "id": acc_id, "name": "a", "email": "a@x.com", "provider": None,
             "imap_host": "h", "imap_port": 993, "use_ssl": 1, "folder": "INBOX",
             "fetch_mode": "incremental", "default_since": "30d",
-            "keywords_override": None,
+            "keywords_override": None, "fetch_method": "imap",
         })
         a = db.get_account(acc_id)
         self.assertEqual(a["fetch_mode"], "incremental")
@@ -154,7 +154,8 @@ class DeleteInvoicesTest(unittest.TestCase):
                            "buyer": "b", "seller": "s", "amount": 1.0,
                            "invoice_no": "INV001", "invoice_date": "2026-07-01",
                            "city": "", "pdf_path": self.pdf_rel,
-                           "source_type": "attachment", "note": ""})
+                           "source_type": "attachment", "note": "",
+                           "remark": "", "buyer_tax": ""})
         self.inv_id = db.conn().execute(
             "SELECT id FROM invoices WHERE invoice_no='INV001'").fetchone()["id"]
 
@@ -186,7 +187,7 @@ class DeleteInvoicesTest(unittest.TestCase):
                            "buyer": "b2", "seller": "s2", "amount": 2.0,
                            "invoice_no": "INV002", "invoice_date": "2026-07-02",
                            "city": "", "pdf_path": "", "source_type": "attachment",
-                           "note": ""})
+                           "note": "", "remark": "", "buyer_tax": ""})
         inv2 = db.conn().execute(
             "SELECT id FROM invoices WHERE invoice_no='INV002'").fetchone()["id"]
         db.update_last_uid(self.acc_id, 100)
@@ -205,7 +206,8 @@ class DeleteInvoicesTest(unittest.TestCase):
                            "buyer": "b3", "seller": "s3", "amount": 3.0,
                            "invoice_no": "INV003", "invoice_date": "2026-07-03",
                            "city": "", "pdf_path": self.pdf_rel,
-                           "source_type": "seed", "note": ""})
+                           "source_type": "seed", "note": "",
+                           "remark": "", "buyer_tax": ""})
         inv3 = db.conn().execute(
             "SELECT id FROM invoices WHERE invoice_no='INV003'").fetchone()["id"]
         db.delete_invoices([inv3])

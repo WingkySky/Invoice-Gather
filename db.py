@@ -813,8 +813,10 @@ def _apply_filters(sql, filters, params):
             params.append(filters["date_to"])
     if filters.get("keyword"):
         kw = f"%{filters['keyword']}%"
-        sql += " AND (i.buyer LIKE ? OR i.seller LIKE ? OR i.invoice_no LIKE ? OR i.city LIKE ?)"
-        params += [kw, kw, kw, kw]
+        sql += (" AND (i.buyer LIKE ? OR i.seller LIKE ? OR i.invoice_no LIKE ? "
+                " OR i.city LIKE ? OR a.name LIKE ? OR a.email LIKE ? "
+                " OR c.name LIKE ? OR CAST(i.amount AS TEXT) LIKE ?)")
+        params += [kw] * 8
     if filters.get("company_id"):
         sql += " AND i.company_id=?"
         params.append(filters["company_id"])
@@ -825,6 +827,16 @@ def _apply_filters(sql, filters, params):
             ph = ",".join("?" * len(statuses))
             sql += f" AND i.attribution_status IN ({ph})"
             params += statuses
+    # 金额筛选
+    if filters.get("amount"):
+        sql += " AND ABS(i.amount - ?) < 0.01"  # 精确匹配(浮点数误差容忍)
+        params.append(filters["amount"])
+    if filters.get("amount_min"):
+        sql += " AND i.amount >= ?"
+        params.append(filters["amount_min"])
+    if filters.get("amount_max"):
+        sql += " AND i.amount <= ?"
+        params.append(filters["amount_max"])
     return sql, params
 
 
@@ -855,7 +867,9 @@ def get_invoices_count(filters=None):
     """与 get_invoices 同筛选条件的总数（用于分页器）。"""
     filters = filters or {}
     c = conn()
-    sql = "SELECT COUNT(*) AS n FROM invoices i WHERE 1=1"
+    sql = ("SELECT COUNT(*) AS n FROM invoices i "
+           "LEFT JOIN accounts a ON i.account_id=a.id "
+           "LEFT JOIN companies c ON i.company_id=c.id WHERE 1=1")
     params = []
     sql, params = _apply_filters(sql, filters, params)
     n = c.execute(sql, params).fetchone()["n"]
@@ -869,7 +883,9 @@ def get_stats(filters=None):
     filters = filters or {}
     c = conn()
     params = []
-    sql = "SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM invoices i WHERE 1=1"
+    sql = ("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total "
+           "FROM invoices i LEFT JOIN accounts a ON i.account_id=a.id "
+           "LEFT JOIN companies c ON i.company_id=c.id WHERE 1=1")
     sql, params = _apply_filters(sql, filters, params)
     row = c.execute(sql, params).fetchone()
     count = row["n"]
@@ -878,7 +894,9 @@ def get_stats(filters=None):
     # 按买方聚合（SQL GROUP BY，而非 Python 循环）
     params2 = []
     sql2 = ("SELECT COALESCE(NULLIF(buyer, ''), '(未知)') AS buyer, "
-            "COALESCE(SUM(amount), 0) AS s FROM invoices i WHERE 1=1")
+            "COALESCE(SUM(amount), 0) AS s FROM invoices i "
+            "LEFT JOIN accounts a ON i.account_id=a.id "
+            "LEFT JOIN companies c ON i.company_id=c.id WHERE 1=1")
     sql2, params2 = _apply_filters(sql2, filters, params2)
     sql2 += " GROUP BY COALESCE(NULLIF(buyer, ''), '(未知)') ORDER BY s DESC"
     by_buyer_rows = c.execute(sql2, params2).fetchall()

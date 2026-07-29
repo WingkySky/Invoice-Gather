@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>票归集 · 发票台账</title>
 <link rel="stylesheet" href="common.css">
+<style>
+.searchbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:relative}
+.searchbar .sb-icon{position:absolute;left:12px;width:16px;height:16px;color:var(--muted);pointer-events:none}
+.searchbar .sb-input{padding-left:36px;flex:1;min-width:240px}
+.searchbar .sb-sep{width:1px;height:26px;background:var(--line);margin:0 2px}
+.searchbar .sb-tilde{color:var(--muted)}
+.searchbar .sb-date{width:150px}
+@media(max-width:640px){.searchbar .sb-date{width:46%}.searchbar .sb-input{min-width:160px}}
+</style>
 </head>
 <body>
 <header class="topbar">
@@ -25,24 +34,24 @@
   <div class="panel filter-panel">
     <h2>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-      筛选 / 搜索
+      搜索
     </h2>
-    <div class="row">
-      <input class="grow" id="f_keyword" placeholder="关键字（买方/销售方/发票号/城市）">
-      <select id="f_account" class="grow"><option value="">全部邮箱</option></select>
-      <select id="f_city" class="grow"><option value="">全部城市</option></select>
-      <select id="f_buyer" class="grow"><option value="">全部买方</option></select>
-      <select id="f_seller" class="grow"><option value="">全部销售方</option></select>
-      <select id="f_company" class="grow"><option value="">全部所属公司</option></select>
-      <select id="f_attr" class="grow"><option value="">全部归属状态</option><option value="classified">已归类</option><option value="unclassified">未归类</option><option value="ambiguous">歧义</option></select>
-      <input type="date" id="f_from" title="开始日期">
-      <input type="date" id="f_to" title="结束日期">
-      <button onclick="resetPageAndLoad()">
+    <div class="searchbar">
+      <span class="sb-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      </span>
+      <input id="f_q" class="sb-input" placeholder="搜索 发票号 / 买方 / 销售方 / 城市 / 邮箱 / 所属公司 / 金额…" autocomplete="off">
+      <span class="sb-sep"></span>
+      <input type="date" id="f_from" class="sb-date" title="开始日期">
+      <span class="sb-tilde">~</span>
+      <input type="date" id="f_to" class="sb-date" title="结束日期">
+      <button id="btnSearch" onclick="doSearch()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
         查询
       </button>
       <button class="ghost" onclick="resetFilters()">重置</button>
     </div>
+    <span id="searchTip" class="pill" style="background:var(--bg);color:var(--muted);font-size:12px;margin-top:8px;display:inline-block"></span>
   </div>
 
   <div class="panel list-panel">
@@ -187,19 +196,18 @@ let _statsSeq = 0;
 
 function currentFilters(){
   return {
-    keyword: document.getElementById('f_keyword').value.trim(),
-    account_id: document.getElementById('f_account').value,
-    city: document.getElementById('f_city').value,
-    buyer: document.getElementById('f_buyer').value,
-    seller: document.getElementById('f_seller').value,
-    company_id: document.getElementById('f_company').value,
-    attribution_status: document.getElementById('f_attr').value,
+    keyword: document.getElementById('f_q').value.trim(),
     date_from: document.getElementById('f_from').value,
     date_to: document.getElementById('f_to').value,
+    company_id: window.__initCompanyId || '',
   };
 }
+
+function doSearch(){ resetPageAndLoad(); }
+
 function resetFilters(){
-  ['f_keyword','f_account','f_city','f_buyer','f_seller','f_company','f_attr','f_from','f_to'].forEach(id=>document.getElementById(id).value='');
+  ['f_q','f_from','f_to'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('searchTip').textContent = '';
   _cachedRows = []; _cachedTotal = 0; _cachedStats = null;
   resetPageAndLoad();
 }
@@ -371,34 +379,10 @@ function renderStats(s){
 }
 
 async function loadSelectors(){
-  const [accs, cities, buyers, sellers, comps] = await Promise.all([
-    API('/api/accounts'), API('/api/cities'), API('/api/buyers'), API('/api/sellers'), API('/api/companies')]);
-  const prevAccount = document.getElementById('f_account').value;
-  const prevCity = document.getElementById('f_city').value;
-  const prevBuyer = document.getElementById('f_buyer').value;
-  const prevSeller = document.getElementById('f_seller').value;
-  const prevCompany = document.getElementById('f_company').value;
-  document.getElementById('f_account').innerHTML =
-    '<option value="">全部邮箱</option>' + accs.map(a=>`<option value="${a.id}">${escapeHtml(a.name)} (${escapeHtml(a.email)})</option>`).join('');
-  document.getElementById('f_city').innerHTML =
-    '<option value="">全部城市</option>' + cities.map(c=>`<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
-  document.getElementById('f_buyer').innerHTML =
-    '<option value="">全部买方</option>' + buyers.map(b=>`<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
-  document.getElementById('f_seller').innerHTML =
-    '<option value="">全部销售方</option>' + sellers.map(s=>`<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
-  document.getElementById('f_company').innerHTML =
-    '<option value="">全部所属公司</option>' + comps.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
-  if(prevAccount && accs.some(a=>String(a.id)===prevAccount)) document.getElementById('f_account').value = prevAccount;
-  if(prevCity && cities.includes(prevCity)) document.getElementById('f_city').value = prevCity;
-  if(prevBuyer && buyers.includes(prevBuyer)) document.getElementById('f_buyer').value = prevBuyer;
-  if(prevSeller && sellers.includes(prevSeller)) document.getElementById('f_seller').value = prevSeller;
-  if(prevCompany && comps.some(c=>String(c.id)===prevCompany)) document.getElementById('f_company').value = prevCompany;
-  _companies = comps;
-  // 来自公司页带参跳转：填充下拉后再设初值，确保 option 已存在
-  if(window.__initCompanyId){
-    const id = String(window.__initCompanyId);
-    if(comps.some(c=>String(c.id)===id)) document.getElementById('f_company').value = id;
-  }
+  // 统一搜索栏去掉了各下拉筛选，这里仅加载「所属公司」列表，
+  // 供批量改所属公司弹窗使用；发票列表的 company_id 过滤改由 URL 参数(__initCompanyId)注入。
+  const comps = await API('/api/companies');
+  _companies = comps || [];
 }
 
 async function uploadFiles(input){
@@ -481,7 +465,16 @@ async function reconcile(dry){
   else { alert(r.msg || '启动失败'); }
 }
 
-document.getElementById('f_keyword').addEventListener('keydown', e=>{ if(e.key==='Enter') resetPageAndLoad(); });
+// 统一搜索栏：回车即搜 + 输入时防抖自动搜索
+let _sbTimer = null;
+const _qEl = document.getElementById('f_q');
+_qEl.addEventListener('keydown', e=>{ if(e.key==='Enter'){ clearTimeout(_sbTimer); resetPageAndLoad(); } });
+_qEl.addEventListener('input', ()=>{
+  clearTimeout(_sbTimer);
+  _sbTimer = setTimeout(()=>{ currentPage=1; load(); }, 350);
+});
+document.getElementById('f_from').addEventListener('change', ()=>resetPageAndLoad());
+document.getElementById('f_to').addEventListener('change', ()=>resetPageAndLoad());
 
 /* ---- 批量改所属公司 ---- */
 function openAssignModal(){
@@ -558,8 +551,8 @@ function notifyHeight(){
 
 renderNav('invoices');
 initCrumb();
-// 必须等 loadSelectors 完成（f_company 下拉已填、__initCompanyId 已应用）再 load()，
-// 否则 ?company_id=X 过滤不生效——下拉还是空的，查询会返回全部发票。
+// 公司下钻：company_id 过滤直接读 URL 参数(window.__initCompanyId，由 initCrumb 设置)，不依赖下拉；
+// loadSelectors 仅加载「所属公司」列表供批量改所属公司弹窗使用，对列表过滤无影响。
 (async () => {
   await loadSelectors();
   load();
