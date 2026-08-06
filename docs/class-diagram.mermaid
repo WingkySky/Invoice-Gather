@@ -1,0 +1,114 @@
+classDiagram
+    %% ===================== 前端（零构建原生 JS / SPA） =====================
+    class CacheStore {
+        +NS : {INVOICES, COMPANIES, ACCOUNTS, STATS}
+        -_mem : Map~ns+key, entry~
+        +get(ns, key) entry|null
+        +set(ns, key, data, version)
+        +purge(ns, key?) 
+        +purgeAll()
+        -_onStorageEvt(e)  «跨 tab 失效»
+    }
+    class GlobalStore {
+        -state : {invoices[], companies[], accounts[], filters, stats}
+        -listeners : Set~fn~
+        +getState() object
+        +setState(patch)
+        +subscribe(fn) unsub
+        +emit(evt, payload)
+    }
+    class Router {
+        -routes : Map~hash, ViewCtor~
+        -current : View|null
+        +start()
+        +navigate(hash)
+        -_mountView(ctor, ctx)
+        -_unmountCurrent()
+    }
+    class View {
+        <<interface>>
+        +mount(container, ctx)
+        +unmount()
+        +onFilter(filters)
+        +onSort(key, asc)
+    }
+    class InvoicesView {
+        +mount(container, ctx)
+        +unmount()
+        +onSort(key, asc)  «前端本地»
+        -_renderRows(rows)
+    }
+    class CompaniesView {
+        +mount(container, ctx)
+        +unmount()
+    }
+    class ConsoleView {
+        +mount(container, ctx)
+        +unmount()
+    }
+    class ApiClient {
+        +get(path) Promise~{rows,total,version}~
+        +post(path, body) Promise  «成功后 purge 缓存»
+        -_readVersion(resp)
+    }
+    class Perf {
+        +mark(name)
+        +measure(from, to)
+        +report()  «console + 可选 /api/metrics»
+    }
+
+    Router "1" *-- "many" View : mounts
+    View <|-- InvoicesView
+    View <|-- CompaniesView
+    View <|-- ConsoleView
+    InvoicesView ..> GlobalStore : 读数据集
+    InvoicesView ..> ApiClient : 拉取/失效
+    CompaniesView ..> GlobalStore
+    ConsoleView ..> GlobalStore
+    ApiClient ..> CacheStore : 读写缓存
+    CacheStore ..> GlobalStore : 变更广播
+
+    %% ===================== 后端（Python 标准库，零依赖） =====================
+    class ConnectionPool {
+        -_local : threading.local
+        -_lock : Lock
+        -_active : int
+        -_max : int
+        +get_conn() conn  «线程级复用»
+        +put_conn(conn)
+        +stats() {active, max, created}
+    }
+    class InvoiceRepo {
+        +get_invoices_merged(filters, page, size) (rows, total)
+        +get_invoices_count(filters) int  «@deprecated»
+        +get_invoices_all(filters, cap) list  «P1 全量进内存»
+    }
+    class DataVersion {
+        -_ver : int
+        -_lock : Lock
+        +get() int
+        +bump()  «写操作后调用»
+    }
+    class CacheHeaders {
+        +cache_control(h, max_age, immutable)
+        +etag(h, tag)
+        +no_cache(h)
+    }
+    class Handler {
+        +do_GET()
+        +do_POST()
+        -_json_cached(obj, version)
+        -_send_file_cached(path, ctype, name)
+    }
+
+    Handler ..> ConnectionPool : get_conn
+    Handler ..> InvoiceRepo : get_invoices_merged
+    Handler ..> CacheHeaders : 缓存头
+    Handler ..> DataVersion : 读 version 进响应头
+    InvoiceRepo ..> ConnectionPool
+    ConnectionPool ..> DataVersion : bump（写路径）
+    InvoiceRepo ..> DataVersion : 读 version
+
+    note for CacheStore "key 格式: ih:&lt;ns&gt;:&lt;fingerprint&gt;\nvalue: {v:dataVersion, ts, data}"
+    note for ConnectionPool "WAL 下每线程独立连接；\n写串行化由 busy_timeout 保证"
+    note for DataVersion "内存镜像 + meta 表持久化\n重启后不丢版本"

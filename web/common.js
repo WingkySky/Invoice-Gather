@@ -81,3 +81,59 @@ function renderNav(active){
     `<a class="nav-link${it.k===active?' active':''}" href="${it.href}">${it.label}</a>`
   ).join('');
 }
+
+/* ---------- 缓存失效（写成功后调用） ---------- */
+// 清本地 CacheStore 指定命名空间（或命名空间列表），并向本 tab + 其他 tab 广播失效。
+function invalidateCache(ns){
+  if(!window.CacheStore) return;
+  var list = Array.isArray(ns) ? ns : [ns];
+  list.forEach(function(n){ CacheStore.purge(n); });
+  if(list.length) CacheStore.broadcast(list[0], null);
+}
+
+// 写操作薄封装：成功 → 按命名空间失效缓存 + 轻提示"已更新"。
+// invalidateNs: 字符串或数组（见缓存命名空间 NS）。保留现有 API() 调用习惯。
+async function postWithInvalidate(url, body, invalidateNs){
+  const nsList = invalidateNs ? (Array.isArray(invalidateNs) ? invalidateNs : [invalidateNs]) : [];
+  const r = await API(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+  if(r && r.ok){
+    invalidateCache(nsList);
+    toast('已更新');
+  }
+  return r;
+}
+
+// P1·E SPA 哈希导航占位（P0 不启用，保持兼容保留）。
+function renderNavSpa(active){ /* TODO(P1): 哈希链接导航 + 无整页重载 */ }
+
+/* ---------- 顶部细进度条 / "更新中"角标 / 陈旧标注 / 轻提示 ---------- */
+function showTopProgress(){ const e=document.getElementById('topProgress'); if(e) e.classList.add('active'); }
+function hideTopProgress(){ const e=document.getElementById('topProgress'); if(e) e.classList.remove('active'); }
+function showUpdating(){
+  const e=document.getElementById('updatingBadge'); if(e) e.hidden=false;
+  showTopProgress();
+}
+function hideUpdating(){
+  const e=document.getElementById('updatingBadge'); if(e) e.hidden=true;
+  hideTopProgress();
+}
+function showStale(ts){
+  const e=document.getElementById('staleBadge'); if(!e) return;
+  const mins = Math.max(1, Math.round((Date.now() - (ts||Date.now()))/60000));
+  e.textContent = '显示的是 '+mins+' 分钟前数据';
+  e.hidden = false;
+}
+function hideStale(){ const e=document.getElementById('staleBadge'); if(e) e.hidden=true; }
+
+// 轻提示 toast（写操作成功后的非阻塞反馈）。
+function toast(msg){
+  let t = document.getElementById('__toast');
+  if(!t){
+    t = document.createElement('div'); t.id='__toast'; t.className='toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._tm);
+  t._tm = setTimeout(()=>t.classList.remove('show'), 1800);
+}

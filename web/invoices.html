@@ -25,6 +25,8 @@
   <div class="who">发票归集中枢</div>
 </header>
 
+<div class="top-progress" id="topProgress"></div>
+
 <div class="wrap">
   <!-- 面包屑：来自公司页带参跳转时显示「公司管理 › X公司 › 发票」，上下文不丢 -->
   <div class="crumb" id="crumb"></div>
@@ -58,6 +60,8 @@
     <h2 class="list-title">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/></svg>
       发票记录
+      <span class="updating-badge" id="updatingBadge" hidden>更新中…</span>
+      <span class="stale-badge" id="staleBadge" hidden></span>
     </h2>
     <div class="toolbar">
       <button class="ghost" onclick="document.getElementById('fileIn').click()">
@@ -180,6 +184,8 @@
 </div>
 
 <script src="common.js"></script>
+<script src="cache.js"></script>
+<script src="store.js"></script>
 <script>
 /* ======================================================== 发票台账（独立页） */
 let _companies = [];           // 公司缓存，供筛选下拉 + 批量改所属公司弹窗复用
@@ -213,41 +219,79 @@ function resetFilters(){
 }
 function resetPageAndLoad(){ currentPage=1; load(); }
 
-async function load(){
-  const seq = ++_loadSeq;
+function _clearSortArrows(){
   document.querySelectorAll('#tbl th').forEach(x=>{
     if(x.dataset.k) x.textContent = x.textContent.replace(/[▲▼]$/,'');
   });
+}
+
+function _cacheSnapshot(data){
+  _cachedRows = (data && data.rows) ? data.rows : [];
+  _cachedTotal = (data && typeof data.total === 'number') ? data.total : 0;
+}
+
+// 仅首次无缓存时使用骨架屏占位（替代全屏"加载中"遮罩）
+function renderSkeleton(){
+  const tb = document.getElementById('tbody');
+  let h = '';
+  for(let i=0;i<Math.min(currentPageSize, 12);i++){
+    h += '<tr class="skeleton-row"><td class="checkbox-cell"></td>' +
+         Array(12).fill('<td><div class="skeleton-bar"></div></td>').join('') + '</tr>';
+  }
+  tb.innerHTML = h;
+  document.getElementById('empty').style.display = 'none';
+}
+
+// 缓存优先渲染：先用 CacheStore 快照立即渲染（<200ms），再后台静默刷新打补丁。
+// 顶部细进度条 / "更新中"角标 替代全屏"加载中"遮罩；仅首次无缓存用骨架屏。
+function load(){
+  const seq = ++_loadSeq;
+  _clearSortArrows();
   const f = stripEmpty(currentFilters());
+  const fpObj = Object.assign({}, f, { page: currentPage, size: currentPageSize });
   const params = new URLSearchParams(f);
   params.set('page', currentPage);
   params.set('page_size', currentPageSize);
+  const url = '/api/invoices?' + params.toString();
 
-  const tb = document.getElementById('tbody');
-  if(_cachedRows.length === 0){
-    tb.innerHTML = '<tr><td colspan="13" class="empty">加载中…</td></tr>';
-    document.getElementById('empty').style.display = 'none';
+  // 首次无缓存：骨架屏占位（禁止全屏遮罩）
+  if(!window.CacheStore || !CacheStore.get('invoices', CacheStore.fp(fpObj))){
+    renderSkeleton();
   }
 
-  let data;
-  try{
-    data = await API('/api/invoices?' + params.toString());
-  }catch(e){
-    if(seq === _loadSeq){
-      if(_cachedRows.length > 0){ renderRows(_cachedRows, _cachedTotal, seq, f); }
-      else { tb.innerHTML = '<tr><td colspan="13" class="empty" style="color:var(--bad)">加载失败，点击 <a href="javascript:load()">重试</a></td></tr>'; }
+  ApiClient.get('invoices', url, {
+    filters: fpObj,
+    onCache: function(data){
+      if(seq !== _loadSeq) return;
+      _cacheSnapshot(data);
+      renderRows(_cachedRows, _cachedTotal, seq, f);
+      showUpdating(); hideStale();
+    },
+    onData: function(data){
+      if(seq !== _loadSeq) return;
+      _cacheSnapshot(data);
+      renderRows(_cachedRows, _cachedTotal, seq, f);
+      hideUpdating(); hideStale();
+    },
+    onSame: function(){
+      if(seq !== _loadSeq) return;
+      hideUpdating(); hideStale();
+    },
+    onStale: function(data, ts){
+      if(seq !== _loadSeq) return;
+      _cacheSnapshot(data);
+      renderRows(_cachedRows, _cachedTotal, seq, f);
+      showStale(ts); hideUpdating();
+    },
+    onError: function(){
+      if(seq !== _loadSeq) return;
+      const tb = document.getElementById('tbody');
+      tb.innerHTML = '<tr><td colspan="13" class="empty" style="color:var(--bad)">加载失败，点击 <a href="javascript:load()">重试</a></td></tr>';
     }
-    return;
-  }
-  if(seq !== _loadSeq) return;
-
-  const rows = data.rows || [];
-  const total = data.total || 0;
-  if(total === 0 && _cachedRows.length > 0){ renderRows(_cachedRows, _cachedTotal, seq, f); }
-  else { _cachedRows = rows; _cachedTotal = total; renderRows(rows, total, seq, f); }
+  });
 }
 
-function renderRows(rows, total, seq, filters){
+function renderRows(rows, total, seq, filters, skipStats){
   const tb = document.getElementById('tbody');
   document.getElementById('empty').style.display = rows.length ? 'none':'block';
   totalRows = total;
@@ -290,7 +334,7 @@ function renderRows(rows, total, seq, filters){
   }
   renderPager();
   syncSel();
-  loadStats(filters);
+  if(!skipStats) loadStats(filters);
   notifyHeight();
 }
 
@@ -300,7 +344,8 @@ document.querySelectorAll('#tbl th[data-k]').forEach(th=>{
     document.querySelectorAll('#tbl th').forEach(x=>{ if(x.dataset.k) x.textContent=x.textContent.replace(/[▲▼]$/,''); });
     if(sortK===k) sortAsc=!sortAsc; else {sortK=k;sortAsc=true;}
     th.textContent += sortAsc?'▲':'▼';
-    load();
+    // 纯前端本地排序：仅对当前已加载页重排渲染，0 服务端请求
+    renderRows(_cachedRows, _cachedTotal, _loadSeq, stripEmpty(currentFilters()), true);
   };
 });
 
@@ -357,15 +402,17 @@ function onPageSizeChange(){
   currentPage = 1; load();
 }
 
-async function loadStats(filters){
+function loadStats(filters){
   const seq = ++_statsSeq;
   const f = filters !== undefined ? stripEmpty(filters) : stripEmpty(currentFilters());
-  let s;
-  try{ s = await API('/api/stats?' + new URLSearchParams(f)); }
-  catch(e){ if(seq === _statsSeq && _cachedStats){ renderStats(_cachedStats); } return; }
-  if(seq !== _statsSeq) return;
-  if(s.count === 0 && _cachedStats && _cachedStats.count > 0){ renderStats(_cachedStats); return; }
-  _cachedStats = s; renderStats(s);
+  const url = '/api/stats?' + new URLSearchParams(f).toString();
+  ApiClient.get('stats', url, {
+    filters: f,
+    onCache: function(s){ if(seq === _statsSeq) renderStats(s); },
+    onData: function(s){ if(seq === _statsSeq){ _cachedStats = s; renderStats(s); } },
+    onSame: function(s){ if(seq === _statsSeq){ _cachedStats = s; renderStats(s); } },
+    onStale: function(s){ if(seq === _statsSeq){ _cachedStats = s; renderStats(s); } }
+  });
 }
 function renderStats(s){
   let html = `

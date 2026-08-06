@@ -174,3 +174,41 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
   .table-wrap{max-height:calc(100vh - 420px)}
   th,td{padding:7px 8px;font-size:12px}
 }
+
+/* ---------- 顶部细进度条（后台静默刷新时显示，替代全屏遮罩） ---------- */
+.top-progress{position:fixed;top:0;left:0;right:0;height:3px;background:transparent;
+             z-index:60;overflow:hidden;opacity:0;transition:opacity .2s;pointer-events:none}
+.top-progress.active{opacity:1}
+.top-progress::after{content:"";position:absolute;left:0;top:0;height:100%;width:40%;
+             background:var(--accent);border-radius:3px;animation:ih-indet 1.1s ease-in-out infinite}
+@keyframes ih-indet{0%{left:-40%}100%{left:100%}}
+
+/* ---------- "更新中"角标（缓存命中后后台刷新时的柔和提示） ---------- */
+.updating-badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:500;
+                color:var(--accent);background:var(--accent-soft);border-radius:20px;
+                padding:2px 10px;margin-left:8px;vertical-align:middle}
+.updating-badge::before{content:"";width:8px;height:8px;border-radius:50%;
+                border:2px solid var(--accent);border-top-color:transparent;
+                animation:ih-spin .7s linear infinite}
+@keyframes ih-spin{to{transform:rotate(360deg)}}
+
+/* ---------- 陈旧数据角标（后台刷新失败，保留快照时标注） ---------- */
+.stale-badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:500;
+             color:var(--warn);background:#fdf6e3;border:1px solid #f0d882;border-radius:20px;
+             padding:2px 10px;margin-left:8px;vertical-align:middle}
+
+/* ---------- 骨架屏（仅首次无缓存时使用，禁止全屏"加载中"遮罩） ---------- */
+.skeleton-row td{height:42px;padding:0 12px}
+.skeleton-bar{height:12px;border-radius:6px;
+              background:linear-gradient(90deg,#eee 25%,#f5f5f5 37%,#eee 63%);
+              background-size:400% 100%;animation:ih-sk 1.3s ease infinite}
+@keyframes ih-sk{0%{background-position:100% 0}100%{background-position:-100% 0}}
+
+/* hidden 属性需显式生效（否则被 .updating-badge/.stale-badge 的 display:inline-flex 覆盖） */
+.updating-badge[hidden], .stale-badge[hidden]{ display:none; }
+
+/* ---------- 轻提示 toast ---------- */
+.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(10px);
+       background:#32303f;color:#fff;font-size:13px;padding:9px 18px;border-radius:22px;
+       box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:80}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}

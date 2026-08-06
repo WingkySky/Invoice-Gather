@@ -12,6 +12,7 @@ import sqlite3
 import os
 import re
 import json
+import threading
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -91,23 +92,143 @@ CREATE INDEX IF NOT EXISTS idx_company_name ON companies(name);
 """
 
 
+class _PooledConnection(sqlite3.Connection):
+    """sqlite3 连接子类：close() 不真正关闭，而是回滚未提交事务后保留连接，
+    供每线程复用（WAL 下连接不跨线程共享，安全）。"""
+
+    def close(self):
+        try:
+            if getattr(self, "in_transaction", False):
+                super().rollback()
+        except Exception:
+            pass
+        # 不释放底层句柄，连接随线程常驻复用
+
+
+class ConnectionPool:
+    """线程级连接池：同一线程多次取连接返回同一对象（单发票页 ~6 连接 → ~1）。
+    WAL 模式下每线程独立连接、不跨线程共享；写竞争由 busy_timeout 兜底。"""
+
+    def __init__(self, max_connections: int = 32, busy_timeout: int = 8000):
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._max = int(max_connections)
+        self._busy_timeout = int(busy_timeout)
+        self._active = 0
+        self._created = 0
+
+    def _create(self):
+        c = sqlite3.connect(DB_PATH, timeout=10, factory=_PooledConnection)
+        c.row_factory = sqlite3.Row
+        try:
+            c.execute("PRAGMA busy_timeout=?", (self._busy_timeout,))
+            c.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        return c
+
+    def get_conn(self):
+        """返回当前线程复用的连接；同线程首次调用创建，之后复用同一对象。"""
+        existing = getattr(self._local, "conn", None)
+        if existing is not None:
+            return existing
+        c = self._create()
+        self._local.conn = c
+        with self._lock:
+            self._active += 1
+            self._created += 1
+        return c
+
+    def put_conn(self, conn):
+        # 连接随线程常驻，无需归还；写操作由 busy_timeout 兜底竞争。
+        pass
+
+    def stats(self):
+        """返回连接池度量：活跃连接数 / 上限 / 累计创建数。"""
+        with self._lock:
+            return {"active": self._active, "max": self._max, "created": self._created}
+
+
+connection_pool = ConnectionPool()
+
+
+class DataVersion:
+    """数据版本单一真相源：任何写路径 bump 后返回递增整数；持久化到 meta 表，
+    重启后从表读取，不丢版本。只读 API 响应头统一携带 X-Data-Version。"""
+
+    _ver = 0
+    _lock = threading.Lock()
+
+    def get(self):
+        if self._ver == 0:
+            self._load()
+        return self._ver
+
+    def _load(self):
+        try:
+            c = connection_pool.get_conn()
+            c.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+            row = c.execute("SELECT value FROM meta WHERE key='data_version'").fetchone()
+            with self._lock:
+                if row is None:
+                    self._ver = 1
+                    c.execute("INSERT INTO meta(key,value) VALUES('data_version', '1')")
+                    c.commit()
+                else:
+                    try:
+                        self._ver = int(row["value"])
+                    except Exception:
+                        self._ver = 1
+        except Exception:
+            with self._lock:
+                if self._ver == 0:
+                    self._ver = 1
+
+    def bump(self):
+        """递增内存版本并持久化。若当前连接已有活跃事务（写操作尾部调用），
+        则随其提交一起落盘，避免额外提交；否则（独立调用）自行提交，保证持久化。"""
+        with self._lock:
+            self._ver += 1
+            ver = self._ver
+        try:
+            c = connection_pool.get_conn()
+            c.execute("UPDATE meta SET value=? WHERE key='data_version'", (ver,))
+            if not getattr(c, "in_transaction", False):
+                c.commit()
+        except Exception:
+            try:
+                c = connection_pool.get_conn()
+                c.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+                c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('data_version',?)", (ver,))
+                c.commit()
+            except Exception:
+                pass
+        return ver
+
+
+data_version = DataVersion()
+
+
+def get_data_version():
+    """暴露给 api.py / web/app.py：读取全局数据版本。"""
+    return data_version.get()
+
+
 def conn():
+    """返回当前线程复用的 SQLite 连接（线程级池化）。
+    保留原函数名以兼容既有调用点；内部走 ConnectionPool。"""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(PDF_DIR, exist_ok=True)
-    c = sqlite3.connect(DB_PATH, timeout=10)
-    c.row_factory = sqlite3.Row
-    try:
-        c.execute("PRAGMA busy_timeout=8000")
-        c.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass
-    return c
+    return connection_pool.get_conn()
 
 
 def init():
     """建库建表。幂等，可重复调用。对老库补加新列。"""
     c = conn()
     c.executescript(SCHEMA)
+    # DataVersion 持久化表：确保 data_version 行存在（重启后不丢版本）。
+    c.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+    c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('data_version','1')")
     _migrate_accounts_columns(c)
     _migrate_invoices(c)
     _migrate_company_columns(c)
@@ -355,6 +476,7 @@ def upsert_company(fields):
     _invalidate_company_cache()
     # 新建公司后，把历史发票按新别名重新归属
     _reattribute_after_company_change()
+    data_version.bump()   # 公司变更影响 invoices 归属，bump 数据版本
     return get_company_by_name(name)
 
 
@@ -396,6 +518,7 @@ def update_company(company_id, fields):
         c.close()
     _invalidate_company_cache()
     _reattribute_after_company_change()
+    data_version.bump()   # 公司变更影响 invoices 归属，bump 数据版本
     return get_company(company_id)
 
 
@@ -413,6 +536,7 @@ def delete_company(company_id):
     finally:
         c.close()
     _invalidate_company_cache()
+    data_version.bump()   # 公司删除影响 invoices 归属，bump 数据版本
     return True
 
 
@@ -512,6 +636,7 @@ def backfill_company_attribution(batch_size=200, on_progress=None):
             done += 1
         if on_progress:
             on_progress(done, total)
+    data_version.bump()   # 归属回填改变了 invoices 状态，bump 数据版本
     # 回填后的统计
     c = conn()
     try:
@@ -566,6 +691,7 @@ def upsert_account(a):
             a,
         )
         last_id = cur.lastrowid
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
         r = c.execute("SELECT * FROM accounts WHERE id=?", (last_id or 0,)).fetchone()
         # lastrowid 在 ON CONFLICT DO UPDATE 时可能为 0，退回按 email 查
@@ -580,6 +706,7 @@ def set_account_enabled(acc_id, enabled):
     c = conn()
     try:
         c.execute("UPDATE accounts SET enabled=? WHERE id=?", (1 if enabled else 0, acc_id))
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
     finally:
         c.close()
@@ -589,6 +716,7 @@ def set_account_fetch(acc_id, ts):
     c = conn()
     try:
         c.execute("UPDATE accounts SET last_fetch=? WHERE id=?", (ts, acc_id))
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
     finally:
         c.close()
@@ -631,6 +759,7 @@ def update_account(a):
         )
         if a.get("password"):
             c.execute("UPDATE accounts SET password=:password WHERE id=:id", a)
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
     finally:
         c.close()
@@ -640,6 +769,7 @@ def delete_account(acc_id):
     try:
         r = c.execute("SELECT email FROM accounts WHERE id=?", (acc_id,)).fetchone()
         c.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
     finally:
         c.close()
@@ -752,6 +882,7 @@ def insert_invoice(inv):
             inv,
         )
         new_id = cur.lastrowid if cur.rowcount > 0 else None
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
     finally:
         c.close()
@@ -864,7 +995,11 @@ def get_invoices(filters=None, page=1, page_size=50):
 
 
 def get_invoices_count(filters=None):
-    """与 get_invoices 同筛选条件的总数（用于分页器）。"""
+    """与 get_invoices 同筛选条件的总数（用于分页器）。
+
+    @deprecated: 已被 get_invoices_merged 取代（单次 SQL 同时返回列表+总数）。
+    保留函数不删除，避免别处引用断裂。
+    """
     filters = filters or {}
     c = conn()
     sql = ("SELECT COUNT(*) AS n FROM invoices i "
@@ -875,6 +1010,40 @@ def get_invoices_count(filters=None):
     n = c.execute(sql, params).fetchone()["n"]
     c.close()
     return n
+
+
+def get_invoices_merged(filters=None, page=1, page_size=50):
+    """单 SQL 合并查询：内层筛选+JOIN+排序，外层 COUNT(*) OVER() 取全量总数，
+    再 LIMIT/OFFSET 分页。返回 (rows, total)。
+
+    窗口函数在 LIMIT 之前作用于内层全集，故 total 为匹配全量（分页正确）。
+    替代原 get_invoices + get_invoices_count 两次 SQL。
+    """
+    filters = filters or {}
+    c = conn()
+    inner = (
+        "SELECT i.*, a.name AS account_name, a.email AS account_email, "
+        "c.name AS company_name "
+        "FROM invoices i LEFT JOIN accounts a ON i.account_id=a.id "
+        "LEFT JOIN companies c ON i.company_id=c.id WHERE 1=1"
+    )
+    params = []
+    inner, params = _apply_filters(inner, filters, params)
+    inner += " ORDER BY i.invoice_date DESC, i.id DESC"
+    sql = "SELECT *, COUNT(*) OVER() AS _total FROM (" + inner + ")"
+    if page_size and page_size > 0:
+        offset = max(0, (page - 1) * page_size)
+        sql += " LIMIT ? OFFSET ?"
+        params += [int(page_size), int(offset)]
+    rows = c.execute(sql, params).fetchall()
+    c.close()
+    out = []
+    total = 0
+    for r in rows:
+        d = dict(r)
+        total = d.pop("_total", 0)
+        out.append(d)
+    return out, total
 
 
 def get_stats(filters=None):
@@ -1068,6 +1237,7 @@ def _delete_invoice_batch(ids, accs_to_check):
                 f"AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.email_id = emails.id)",
                 email_ids,
             )
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
         return n
     finally:
@@ -1090,6 +1260,7 @@ def update_invoice_fields(inv_id, fields):
     vals = list(fields.values()) + [int(inv_id)]
     c = conn()
     c.execute(f"UPDATE invoices SET {sets} WHERE id=?", vals)
+    data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
     c.commit()
     c.close()
     return True
@@ -1116,6 +1287,7 @@ def assign_invoices(invoice_ids, company_id):
             [cid, status, reason] + ids,
         )
         n = cur.rowcount
+        data_version.bump()   # 写后 bump 数据版本（随下方 commit 一起落盘）
         c.commit()
     finally:
         c.close()

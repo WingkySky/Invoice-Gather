@@ -20,6 +20,8 @@ import zipfile
 import uuid
 import tempfile
 import threading
+import sqlite3
+import hashlib
 import datetime as dt
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
@@ -33,6 +35,23 @@ import api
 import matching
 
 INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+
+# ----------------------------------------------------------- 性能度量开关（PERF=1 启用，默认零开销）
+# 仅当环境变量 PERF=1 时安装 SQL 计数器与 debug 路由；默认完全不生效。
+_PERF = os.environ.get("PERF") == "1"
+_LAST_LIST_SQL = {"n": 0}      # 最近一次 /api/invoices 请求的 SQL 条数（验证 2→1）
+_SQL_TOTAL = {"n": 0}          # 进程累计 SQL 条数
+_req_sql = threading.local()   # 每请求线程独立的 SQL 计数器
+
+if _PERF:
+    _orig_exec = sqlite3.Connection.execute
+
+    def _counted_exec(self, *a, **k):
+        _SQL_TOTAL["n"] += 1
+        _req_sql.count = getattr(_req_sql, "count", 0) + 1
+        return _orig_exec(self, *a, **k)
+
+    sqlite3.Connection.execute = _counted_exec
 
 # 自动抓取（Web 控制台里可开关，单位：秒，0=关闭）
 AUTO_INTERVAL = 0
@@ -55,11 +74,37 @@ def _json_default(o):
     raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
 
 
-def _json(handler, obj, status=200):
+def _json(handler, obj, status=200, cache=None, version=None, etag=None):
+    """序列化并写出 JSON。
+
+    - cache: 传 'no-cache' 或完整 Cache-Control 指令（如 'public, max-age=86400'）。
+    - version: 写入 X-Data-Version 响应头（只读 API 统一携带全局数据版本）。
+    - etag: 为空时按 body 内容自动生成；命中 If-None-Match 时直接返回 304（不携带 body）。
+    """
     body = json.dumps(obj, ensure_ascii=False, default=_json_default).encode("utf-8")
+    if etag is None:
+        etag = 'W/"' + hashlib.md5(body).hexdigest() + '"'
+    if handler.headers.get("If-None-Match") == etag:
+        handler.send_response(304)
+        handler.send_header("ETag", etag)
+        if cache == "no-cache":
+            handler.send_header("Cache-Control", "no-cache")
+        elif isinstance(cache, str):
+            handler.send_header("Cache-Control", cache)
+        if version is not None:
+            handler.send_header("X-Data-Version", str(version))
+        handler.end_headers()
+        return
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("ETag", etag)
+    if cache == "no-cache":
+        handler.send_header("Cache-Control", "no-cache")
+    elif isinstance(cache, str):
+        handler.send_header("Cache-Control", cache)
+    if version is not None:
+        handler.send_header("X-Data-Version", str(version))
     handler.end_headers()
     try:
         handler.wfile.write(body)
@@ -265,15 +310,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send_file(self, path, ctype, attachment_name=None):
+    def _send_file(self, path, ctype, attachment_name=None, cache=None):
         if not os.path.isfile(path):
             self.send_error(404)
             return
         with open(path, "rb") as f:
             data = f.read()
+        # 内容哈希 ETag：文件变化则 ETag 变化，浏览器重新下载；否则 304 协商。
+        etag = 'W/"' + hashlib.md5(data).hexdigest() + '"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            if cache:
+                self.send_header("Cache-Control", cache)
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", etag)
+        if cache:
+            self.send_header("Cache-Control", cache)
         # attachment_name 给定时以附件形式下发（Content-Disposition: attachment），
         # 浏览器会下载而非尝试内嵌渲染——用于 OFD 等浏览器无法直接显示的格式，避免"无法加载"。
         # 注意：HTTP 头只能 latin-1，filename= 必须 ASCII；中文名放 filename*=UTF-8''（百分号编码），
@@ -297,9 +354,11 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         qs = parse_qs(u.query)
         path = u.path
+        if _PERF:
+            _req_sql.count = 0
 
         if path in ("/", "/index.html"):
-            self._send_file(INDEX, "text/html; charset=utf-8")
+            self._send_file(INDEX, "text/html; charset=utf-8", cache="public, max-age=86400")
             return
 
         # 多页面静态资源（模块化拆分：发票/公司等独立页面 + 共享 css/js）
@@ -310,14 +369,34 @@ class Handler(BaseHTTPRequestHandler):
             "/common.css": ("text/css; charset=utf-8", "common.css"),
             "/common.js": ("application/javascript; charset=utf-8", "common.js"),
             "/index.js": ("application/javascript; charset=utf-8", "index.js"),
+            "/cache.js": ("application/javascript; charset=utf-8", "cache.js"),
+            "/store.js": ("application/javascript; charset=utf-8", "store.js"),
         }
         if path in _STATIC_PAGES:
             _ctype, _fname = _STATIC_PAGES[path]
             _fp = os.path.join(_WEB, _fname)
             if os.path.isfile(_fp):
-                self._send_file(_fp, _ctype)
+                self._send_file(_fp, _ctype, cache="public, max-age=86400")
             else:
                 self.send_error(404)
+            return
+
+        # ---- 数据版本（只读 API 统一真相源，供前端判失效） ----
+        if path == "/api/version":
+            _json(self, {"version": db.get_data_version()},
+                  cache="no-cache", version=db.get_data_version())
+            return
+
+        # ---- 性能调试：连接池 + SQL 度量（仅 PERF=1 启用，默认零开销） ----
+        if path == "/api/debug/connpool":
+            if not _PERF:
+                self.send_error(404)
+                return
+            stats = db.connection_pool.stats()
+            _json(self, {
+                "active": stats["active"], "max": stats["max"], "created": stats["created"],
+                "last_list_sql": _LAST_LIST_SQL["n"], "sql_total": _SQL_TOTAL["n"],
+            })
             return
 
         if path == "/api/invoices":
@@ -330,13 +409,20 @@ class Handler(BaseHTTPRequestHandler):
                 page_size = int(qs.get("page_size", ["50"])[0] or "50")
             except ValueError:
                 page_size = 50
-            rows = db.get_invoices(filters, page=page, page_size=page_size)
-            total = db.get_invoices_count(filters)
-            _json(self, {"rows": rows, "total": total, "page": page, "page_size": page_size})
+            # 单 SQL 合并查询：列表 + 总数 一次取回（窗口函数 COUNT(*) OVER()）。
+            version = db.get_data_version()
+            if _PERF:
+                _req_sql.count = 0
+            rows, total = db.get_invoices_merged(filters, page=page, page_size=page_size)
+            if _PERF:
+                _LAST_LIST_SQL["n"] = _req_sql.count
+            _json(self, {"rows": rows, "total": total, "page": page, "page_size": page_size},
+                  cache="no-cache", version=version)
             return
 
         if path == "/api/accounts":
-            _json(self, [_safe_acc(a) for a in db.get_accounts()])
+            _json(self, [_safe_acc(a) for a in db.get_accounts()],
+                  cache="no-cache", version=db.get_data_version())
             return
 
         if re.match(r"^/api/accounts/\d+$", path):
@@ -357,33 +443,40 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/cities":
-            _json(self, db.distinct_cities())
+            _json(self, db.distinct_cities(),
+                  cache="no-cache", version=db.get_data_version())
             return
 
         if path == "/api/buyers":
-            _json(self, db.distinct_buyers())
+            _json(self, db.distinct_buyers(),
+                  cache="no-cache", version=db.get_data_version())
             return
 
         if path == "/api/sellers":
-            _json(self, db.distinct_sellers())
+            _json(self, db.distinct_sellers(),
+                  cache="no-cache", version=db.get_data_version())
             return
 
         # 公司清单（P0 公司归属）
         if path == "/api/companies":
-            _json(self, api.list_companies())
+            _json(self, api.list_companies(),
+                  cache="no-cache", version=db.get_data_version())
             return
 
         if path == "/api/attribution/stats":
-            _json(self, api.attribution_summary())
+            _json(self, api.attribution_summary(),
+                  cache="no-cache", version=db.get_data_version())
             return
 
         m = re.match(r"^/api/companies/(\d+)$", path)
         if m:
-            _json(self, api.get_company(int(m.group(1))) or {})
+            _json(self, api.get_company(int(m.group(1))) or {},
+                  cache="no-cache", version=db.get_data_version())
             return
 
         if path == "/api/stats":
-            _json(self, db.get_stats(_parse_filters(qs)))
+            _json(self, db.get_stats(_parse_filters(qs)),
+                  cache="no-cache", version=db.get_data_version())
             return
 
         if path == "/api/fetch/status":
@@ -481,6 +574,8 @@ class Handler(BaseHTTPRequestHandler):
     # ----------------------------------------------------- POST
     def do_POST(self):
         u = urlparse(self.path)
+        if _PERF:
+            _req_sql.count = 0
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
         text = None

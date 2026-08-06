@@ -34,6 +34,8 @@
   <div class="who">发票归集中枢</div>
 </header>
 
+<div class="top-progress" id="topProgress"></div>
+
 <div class="wrap">
   <div class="crumb"><span class="cur">公司管理</span></div>
 
@@ -43,6 +45,8 @@
     <h2>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
       公司清单
+      <span class="updating-badge" id="updatingBadge" hidden>更新中…</span>
+      <span class="stale-badge" id="staleBadge" hidden></span>
     </h2>
     <div class="toolbar">
       <button onclick="openCompanyAdd()">
@@ -90,17 +94,28 @@
 </div>
 
 <script src="common.js"></script>
+<script src="cache.js"></script>
+<script src="store.js"></script>
 <script>
 /* ======================================================== 公司管理（独立页） */
-async function loadCompanies(){
-  try{
-    const comps = await API('/api/companies');
-    renderCompanies(comps);
-  }catch(e){
-    document.getElementById('company_list').innerHTML = '<div class="empty">加载失败：'+e+'</div>';
-  }
-  try{ renderCompanyStats(await API('/api/attribution/stats')); }
-  catch(e){ /* 概况统计非关键，失败不阻塞列表 */ }
+// 缓存优先渲染：先用 CacheStore 快照立即渲染（<200ms），再后台静默刷新打补丁。
+// 顶部细进度条 / "更新中"角标 替代全屏"加载中"遮罩；后台刷新失败保留并标注陈旧。
+function loadCompanies(){
+  ApiClient.get('companies', '/api/companies', {
+    filters: {},
+    onCache: function(comps){ renderCompanies(comps); showUpdating(); },
+    onData: function(comps){ renderCompanies(comps); hideUpdating(); hideStale(); },
+    onSame: function(){ hideUpdating(); hideStale(); },
+    onStale: function(comps){ renderCompanies(comps); showStale(Date.now()); hideUpdating(); },
+    onError: function(){ document.getElementById('company_list').innerHTML = '<div class="empty">加载失败</div>'; }
+  });
+  ApiClient.get('stats', '/api/attribution/stats', {
+    filters: { kind: 'attribution' },
+    onCache: function(s){ renderCompanyStats(s); },
+    onData: function(s){ renderCompanyStats(s); },
+    onSame: function(s){ renderCompanyStats(s); },
+    onStale: function(s){ renderCompanyStats(s); }
+  });
 }
 
 function renderCompanyStats(s){
@@ -180,8 +195,8 @@ async function saveCompany(){
   msg.textContent = '保存中…';
   try{
     let r;
-    if(id){ r = await API(`/api/companies/${id}/update`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); }
-    else { r = await API('/api/companies', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); }
+    if(id){ r = await postWithInvalidate(`/api/companies/${id}/update`, body, ['companies','stats']); }
+    else { r = await postWithInvalidate('/api/companies', body, ['companies','stats']); }
     if(r.ok){ closeCompanyModal(); loadCompanies(); }
     else { msg.textContent = r.msg || '保存失败'; }
   }catch(e){ msg.textContent = '保存失败：'+e; }
@@ -189,14 +204,14 @@ async function saveCompany(){
 
 async function delCompany(id){
   if(!confirm('确认删除该公司？其名下发票会回退为「未归类」。')) return;
-  const r = await API(`/api/companies/${id}/delete`, {method:'POST'});
+  const r = await postWithInvalidate(`/api/companies/${id}/delete`, {}, ['companies','stats']);
   if(r.ok){ loadCompanies(); }
   else { alert('删除失败'); }
 }
 
 async function importCompanies(){
   if(!confirm('把已归集发票的购买方（买方）去重，批量生成为候选公司？\n已有的公司不会重复创建。')) return;
-  const r = await API('/api/companies/import-from-invoices', {method:'POST'});
+  const r = await postWithInvalidate('/api/companies/import-from-invoices', {}, ['companies','stats']);
   if(r.ok){ alert(`已导入 ${r.added||0} 个候选公司`); loadCompanies(); }
   else { alert('导入失败'); }
 }
@@ -208,7 +223,7 @@ async function backfillCompanies(){
   showJobBar();
   await pollJob(r.job_id,
     j => { updateJobBar({done:j.done||0, total:j.total||1}); setExp(j.error ? ('回填失败：'+j.error) : (j.msg||'回填中…')); },
-    j => { hideJobBar(); setExp(j.error ? ('回填失败：'+j.error) : (j.msg||'回填完成')); loadCompanies(); });
+    j => { hideJobBar(); setExp(j.error ? ('回填失败：'+j.error) : (j.msg||'回填完成')); invalidateCache(['companies','stats']); loadCompanies(); });
 }
 
 // 查看发票：就地展开 iframe（嵌入 invoices.html 的 embedded 模式），

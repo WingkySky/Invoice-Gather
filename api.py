@@ -17,6 +17,11 @@ import db
 import engine
 
 
+def get_data_version() -> int:
+    """暴露全局数据版本（只读 API 缓存失效判据：X-Data-Version 的来源）。"""
+    return db.get_data_version()
+
+
 def list_accounts(enabled_only: bool = False) -> List[Dict[str, Any]]:
     """列出全部（或仅启用）账号，返回脱敏后的 dict 列表（不含明文密码）。"""
     rows = db.get_accounts(enabled_only=enabled_only)

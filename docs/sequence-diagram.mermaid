@@ -1,0 +1,71 @@
+%% ============ 场景一：切 tab 回看（缓存命中 → 先显快照 + 后台刷新） ============
+sequenceDiagram
+    participant U as 用户
+    participant V as InvoicesView
+    participant CS as CacheStore
+    participant S as GlobalStore
+    participant API as ApiClient
+    participant BE as 后端 / DB
+
+    U->>V: 切回「发票台账」(hash 切换，无整页重载)
+    V->>CS: get('invoices', filterKey)
+    CS-->>V: 命中快照(内存→sessionStorage) < 200ms
+    V->>S: 用快照立即渲染
+    S-->>U: 数据秒显 + 顶部细进度条/「更新中」角标（无全屏 loading）
+    V->>API: 后台静默 fetch /api/invoices?...（不阻塞 UI）
+    API->>BE: GET（带 If-None-Match / X-Data-Version）
+    BE-->>API: 304 或 200(新 version)
+    alt 数据未变（version 相同）
+        API-->>V: 无变化，保留快照，停止进度条
+    else 数据已变（version 增大）
+        API->>CS: set('invoices', key, newData, ver)
+        CS-->>S: 通知更新
+        S-->>U: 静默差异刷新（无闪烁）
+    end
+    Note over V,U: 后台刷新失败 → 保留快照并标注「显示的是 X 分钟前数据」
+
+%% ============ 场景二：进页面首次加载（缓存优先 vs 骨架屏） ============
+sequenceDiagram
+    participant U as 用户
+    participant A as app.html / SPA 壳
+    participant V as InvoicesView
+    participant CS as CacheStore
+    participant API as ApiClient
+    participant BE as 后端 / DB
+
+    U->>A: 打开 / 刷新页面
+    A->>V: mount(#view)
+    V->>CS: get('invoices', filterKey)
+    alt 有缓存（二次进入）
+        CS-->>V: 快照
+        V-->>U: < 200ms 渲染 + 柔和「更新中」角标（禁止全屏遮罩）
+        V->>API: 后台静默刷新
+        API->>BE: GET /api/invoices
+        BE-->>API: rows + total + X-Data-Version
+        API->>CS: set(...)
+        V-->>U: 差异更新
+    else 无缓存（首次）
+        V-->>U: 仅首次显示骨架屏
+        V->>API: fetch /api/invoices
+        API->>BE: GET（合并 COUNT(*) OVER() 单 SQL）
+        BE-->>API: {rows, total, version}
+        API->>CS: set('invoices', key, data, ver)
+        V-->>U: 渲染数据
+    end
+    Note over U: 写操作成功 → API.post → CS.purge(相关 ns) + 跨 tab 广播 + 轻提示
+
+%% ============ 场景三（P2）：SSE 推进度，替代轮询 ============
+sequenceDiagram
+    participant U as 用户
+    participant FE as 前端 EventSource
+    participant H as Handler(/api/stream)
+    participant BUS as 进度事件总线
+    participant JOB as 后台任务
+
+    U->>FE: 触发抓取/导出
+    FE->>H: GET /api/stream (SSE, 长连接)
+    H-->>FE: :connected 心跳
+    JOB->>BUS: report(done,total,msg)
+    BUS->>H: 推送事件
+    H-->>FE: data: {kind, done, total, msg}
+    FE-->>U: 实时更新进度条（无定时轮询请求）
